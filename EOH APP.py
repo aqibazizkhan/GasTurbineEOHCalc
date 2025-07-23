@@ -1,84 +1,90 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
-from datetime import datetime, timedelta
+from datetime import datetime
 
-st.set_page_config(page_title="Gas Turbine EOH Calculator", layout="wide")
-st.title("🛠️ Gas Turbine EOH Calculator & Overhaul Predictor")
+st.set_page_config(page_title="Gas Turbine EOH Calculator", layout="centered")
 
+st.title("🛠️ Gas Turbine EOH Calculator")
 st.markdown("""
-This tool calculates **Equivalent Operating Hours (EOH)** and predicts gas turbine **overhaul dates** 
-based on fired hours, EOH readings, and firing date after last overhaul.
-Upload your Excel file to get started.
+Upload an Excel file containing date/time and machine RPM to calculate:
+- Fired hours
+- Number of starts
+- Maintenance factor (interpolated)
+- Equivalent Operating Hours (EOH)
 """)
 
-uploaded_file = st.file_uploader("📤 Upload Excel file with 'Date', 'Fired Hours', 'EOH' columns:", type=['xlsx'])
+# User input
+fired_speed_threshold = st.number_input("Fired Speed Threshold (RPM)", value=1100)
+max_fired_hours = st.number_input("Maximum Allowed Fired Hours", value=84000)
+
+uploaded_file = st.file_uploader("📤 Upload Excel File", type=["xlsx"])
 
 if uploaded_file:
     try:
-        df = pd.read_excel(uploaded_file, engine='openpyxl')
-        df.columns = df.columns.str.strip()
-        st.success("✅ File loaded successfully!")
+        sheet_names = pd.ExcelFile(uploaded_file).sheet_names
+        sheet_name = st.selectbox("Select Sheet", sheet_names)
 
-        required_columns = {'Date', 'Fired Hours', 'EOH'}
-        if not required_columns.issubset(df.columns):
-            st.error(f"Missing columns: {required_columns - set(df.columns)}")
-            st.stop()
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
 
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date')
+        if df.shape[1] < 2:
+            st.error("The uploaded file must contain at least two columns: Date and RPM.")
+        else:
+            # Rename for standardization
+            df = df.rename(columns={df.columns[0]: 'Date', df.columns[1]: 'RPM'})
+            df['Date'] = pd.to_datetime(df['Date'])
+            df['Fired'] = df['RPM'] > fired_speed_threshold
+            df = df.sort_values('Date')
 
-        st.subheader("📊 Data Preview")
-        st.dataframe(df.head())
+            # Detect transitions
+            df['Change'] = df['Fired'] != df['Fired'].shift()
+            transitions = df[df['Change']]
 
-        # User input for last overhaul firing date and hours at overhaul
-        st.sidebar.header("🔧 Settings")
-        first_firing_date = st.sidebar.date_input("First Firing Date after Overhaul:", value=df['Date'].min().date())
-        fired_hours_at_oh = st.sidebar.number_input("Fired Hours at Overhaul (typically 0):", value=0.0)
-        eoh_at_oh = st.sidebar.number_input("EOH at Overhaul (typically 0):", value=0.0)
+            # Extract starts and stops
+            firing_starts = transitions[transitions['Fired'] == True]['Date'].reset_index(drop=True)
+            firing_stops = transitions[transitions['Fired'] == False]['Date'].reset_index(drop=True)
 
-        # Latest values
-        latest_date = df['Date'].iloc[-1]
-        latest_fired = df['Fired Hours'].iloc[-1]
-        latest_eoh = df['EOH'].iloc[-1]
+            firing_summary = pd.DataFrame({
+                'Firing Start': firing_starts,
+                'Firing Stop': firing_stops.shift(-1)
+            })
 
-        # Calendar-based OH
-        calendar_oh_date = datetime.combine(first_firing_date, datetime.min.time()) + timedelta(hours=84000)
+            firing_summary['Fired Duration (hrs)'] = (
+                firing_summary['Firing Stop'] - firing_summary['Firing Start']
+            ).dt.total_seconds() / 3600
 
-        # EOH-based OH
-        remaining_eoh = 84000 - (latest_eoh - eoh_at_oh)
-        projected_eoh_date = latest_date + timedelta(hours=remaining_eoh)
+            firing_summary.dropna(inplace=True)
 
-        # Fired Hours based projection using linear interpolation
-        df['Cumulative Fired Hours'] = df['Fired Hours'] - df['Fired Hours'].iloc[0] + fired_hours_at_oh
-        interp = interp1d(df['Cumulative Fired Hours'], df['Date'].astype(np.int64), fill_value="extrapolate")
-        predicted_timestamp = interp(84000)
-        projected_fired_oh_date = pd.to_datetime(predicted_timestamp)
+            st.subheader("⏱️ Firing Start/Stop Summary")
+            st.dataframe(firing_summary)
 
-        # Display results
-        st.subheader("📅 Predicted Overhaul Dates")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Calendar Based", calendar_oh_date.date())
-        col2.metric("EOH Based", projected_eoh_date.date())
-        col3.metric("Fired Hours Based", projected_fired_oh_date.date())
+            # Maintenance factor interpolation
+            x = np.array([0.001, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            y = np.array([1.1, 1.3, 1.45, 1.7, 2.1, 2.9, 4.0, 5.0])
+            mf_interp = interp1d(x, y, kind='linear', fill_value='extrapolate')
 
-        # Plot
-        st.subheader("📈 Trend: EOH vs Date")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(df['Date'], df['EOH'], label='EOH', color='blue')
-        ax.axhline(84000, color='red', linestyle='--', label='Target EOH')
-        ax.axvline(projected_eoh_date, color='green', linestyle='--', label='EOH Projected Date')
-        ax.set_ylabel("EOH")
-        ax.set_xlabel("Date")
-        ax.legend()
-        ax.grid(True)
-        st.pyplot(fig)
+            total_fired_hours = firing_summary['Fired Duration (hrs)'].sum()
+            number_of_starts = len(firing_summary)
+            R = number_of_starts / total_fired_hours if total_fired_hours > 0 else 0
+            maintenance_factor = float(mf_interp(R))
+            EOH = total_fired_hours * maintenance_factor
+
+            st.subheader("📊 EOH Summary")
+            st.markdown(f"""
+            - **Total Fired Hours:** `{total_fired_hours:.2f}` hrs  
+            - **Number of Starts:** `{number_of_starts}`  
+            - **Starts per Fired Hour (R):** `{R:.4f}`  
+            - **Maintenance Factor:** `{maintenance_factor:.2f}`  
+            - **Equivalent Operating Hours (EOH):** `{EOH:.2f}` hrs  
+            """)
+
+            # Progress toward max limit
+            percent_used = (EOH / max_fired_hours) * 100
+            st.progress(min(percent_used, 100), text=f"{percent_used:.1f}% of {max_fired_hours} hrs used")
 
     except Exception as e:
-        st.error(f"❌ Error loading data: {e}")
-        st.stop()
+        st.error(f"❌ Error: {str(e)}")
+
 else:
-    st.info("👈 Upload an Excel file to get started.")
+    st.info("📎 Please upload an Excel file to begin.")
